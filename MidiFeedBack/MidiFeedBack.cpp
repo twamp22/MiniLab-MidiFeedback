@@ -1,4 +1,4 @@
-﻿#include <windows.h>
+#include <windows.h>
 #include <mmsystem.h>
 #include <string>
 #include <thread>
@@ -9,30 +9,113 @@
 
 #pragma comment(lib, "Winmm.lib")
 
-const std::wstring REQUIRED_INPUT_DEVICE = L"Arturia loopMIDI Port";
+// ============================================================================
+// Voicemeeter Remote API
+// ============================================================================
+
+typedef long(__stdcall* T_VBVMR_Login)(void);
+typedef long(__stdcall* T_VBVMR_Logout)(void);
+typedef long(__stdcall* T_VBVMR_IsParametersDirty)(void);
+typedef long(__stdcall* T_VBVMR_GetParameterFloat)(char* szParamName, float* pValue);
+
+T_VBVMR_Login VBVMR_Login = nullptr;
+T_VBVMR_Logout VBVMR_Logout = nullptr;
+T_VBVMR_IsParametersDirty VBVMR_IsParametersDirty = nullptr;
+T_VBVMR_GetParameterFloat VBVMR_GetParameterFloat = nullptr;
+
+HMODULE hVoicemeeterDLL = nullptr;
+
+bool InitializeVoicemeeterAPI() {
+    // Try to find VoicemeeterRemote64.dll in Voicemeeter installation path
+    const wchar_t* paths[] = {
+        L"C:\\Program Files (x86)\\VB\\Voicemeeter\\VoicemeeterRemote64.dll",
+        L"C:\\Program Files\\VB\\Voicemeeter\\VoicemeeterRemote64.dll"
+    };
+
+    for (const auto& path : paths) {
+        hVoicemeeterDLL = LoadLibraryW(path);
+        if (hVoicemeeterDLL) break;
+    }
+
+    if (!hVoicemeeterDLL) {
+        return false;
+    }
+
+    VBVMR_Login = (T_VBVMR_Login)GetProcAddress(hVoicemeeterDLL, "VBVMR_Login");
+    VBVMR_Logout = (T_VBVMR_Logout)GetProcAddress(hVoicemeeterDLL, "VBVMR_Logout");
+    VBVMR_IsParametersDirty = (T_VBVMR_IsParametersDirty)GetProcAddress(hVoicemeeterDLL, "VBVMR_IsParametersDirty");
+    VBVMR_GetParameterFloat = (T_VBVMR_GetParameterFloat)GetProcAddress(hVoicemeeterDLL, "VBVMR_GetParameterFloat");
+
+    if (!VBVMR_Login || !VBVMR_Logout || !VBVMR_IsParametersDirty || !VBVMR_GetParameterFloat) {
+        FreeLibrary(hVoicemeeterDLL);
+        hVoicemeeterDLL = nullptr;
+        return false;
+    }
+
+    long result = VBVMR_Login();
+    if (result < 0) {
+        FreeLibrary(hVoicemeeterDLL);
+        hVoicemeeterDLL = nullptr;
+        return false;
+    }
+
+    return true;
+}
+
+void ShutdownVoicemeeterAPI() {
+    if (VBVMR_Logout) {
+        VBVMR_Logout();
+    }
+    if (hVoicemeeterDLL) {
+        FreeLibrary(hVoicemeeterDLL);
+        hVoicemeeterDLL = nullptr;
+    }
+}
+
+bool GetVoicemeeterMuteState(int stripIndex) {
+    if (!VBVMR_GetParameterFloat) return false;
+
+    char paramName[64];
+    sprintf_s(paramName, "Strip[%d].Mute", stripIndex);
+
+    float value = 0.0f;
+    long result = VBVMR_GetParameterFloat(paramName, &value);
+
+    if (result == 0) {
+        return value >= 1.0f;  // 1.0 = muted, 0.0 = unmuted
+    }
+    return false;
+}
+
+// ============================================================================
+// MIDI and LED Control
+// ============================================================================
+
 const std::wstring REQUIRED_OUTPUT_DEVICE = L"Arturia MiniLab mkII";
 
 struct ButtonConfig {
     int noteNumber;
     std::string name;
+    int voicemeeterStrip;  // Which Voicemeeter strip this button controls
     BYTE defaultColor;
     BYTE muteColor;
 };
 
 struct ButtonState {
-    BYTE color;
+    BYTE defaultColor;
+    BYTE muteColor;
     std::atomic<bool> isMuted;
     std::atomic<bool> isBlinking;
     std::thread* blinkThread;
 
-    ButtonState(BYTE col, bool muted, bool blinking)
-        : color(col), isMuted(muted), isBlinking(blinking), blinkThread(nullptr) {
+    ButtonState(BYTE defCol, BYTE mutCol)
+        : defaultColor(defCol), muteColor(mutCol), isMuted(false), isBlinking(false), blinkThread(nullptr) {
     }
-    ButtonState() : ButtonState(0x01, false, false) {}
+    ButtonState() : ButtonState(0x01, 0x01) {}
 
     ~ButtonState() {
+        isBlinking = false;
         if (blinkThread && blinkThread->joinable()) {
-            isBlinking = false;
             blinkThread->join();
             delete blinkThread;
         }
@@ -43,8 +126,6 @@ std::unordered_map<int, std::unique_ptr<ButtonState>> buttonStates;
 std::vector<ButtonConfig> buttonConfigs;
 HMIDIOUT hMidiOut = nullptr;
 std::atomic<bool> isRunning(true);
-
-// Console output functions removed for headless operation
 
 void SetButtonColor(int buttonIndex, BYTE color) {
     if (!hMidiOut) return;
@@ -67,107 +148,87 @@ void SetButtonColor(int buttonIndex, BYTE color) {
 }
 
 void BlinkButton(int buttonIndex, BYTE color) {
-    while (buttonStates[buttonIndex]->isBlinking && isRunning) {
+    while (buttonStates[buttonIndex]->isBlinking && buttonStates[buttonIndex]->isMuted && isRunning) {
         SetButtonColor(buttonIndex, 0x00);
         Sleep(500);
-        if (!buttonStates[buttonIndex]->isBlinking || !isRunning) break;
+        if (!buttonStates[buttonIndex]->isBlinking || !buttonStates[buttonIndex]->isMuted || !isRunning) break;
         SetButtonColor(buttonIndex, color);
         Sleep(500);
     }
 }
 
-void HandleButtonPress(int buttonIndex, BYTE data2) {
-    if (buttonIndex >= buttonConfigs.size()) {
-        return;
+void StartBlinking(int buttonIndex) {
+    ButtonState* state = buttonStates[buttonIndex].get();
+
+    // Stop existing blink thread if running
+    state->isBlinking = false;
+    if (state->blinkThread && state->blinkThread->joinable()) {
+        state->blinkThread->join();
+        delete state->blinkThread;
+        state->blinkThread = nullptr;
     }
 
-    ButtonConfig& config = buttonConfigs[buttonIndex];
+    state->isBlinking = true;
+    state->blinkThread = new std::thread(BlinkButton, buttonIndex, state->muteColor);
+}
 
-    if (data2 == 127 && !buttonStates[buttonIndex]->isMuted) {
-        buttonStates[buttonIndex]->isMuted = true;
-        buttonStates[buttonIndex]->isBlinking = true;
+void StopBlinking(int buttonIndex) {
+    ButtonState* state = buttonStates[buttonIndex].get();
+    state->isBlinking = false;
 
-        if (buttonStates[buttonIndex]->blinkThread && buttonStates[buttonIndex]->blinkThread->joinable()) {
-            buttonStates[buttonIndex]->blinkThread->join();
-            delete buttonStates[buttonIndex]->blinkThread;
+    if (state->blinkThread && state->blinkThread->joinable()) {
+        state->blinkThread->join();
+        delete state->blinkThread;
+        state->blinkThread = nullptr;
+    }
+
+    SetButtonColor(buttonIndex, state->defaultColor);
+}
+
+void UpdateButtonFromVoicemeeter(int buttonIndex) {
+    if (buttonIndex >= buttonConfigs.size()) return;
+
+    int stripIndex = buttonConfigs[buttonIndex].voicemeeterStrip;
+    bool isMuted = GetVoicemeeterMuteState(stripIndex);
+    ButtonState* state = buttonStates[buttonIndex].get();
+
+    // Only update if state changed
+    if (isMuted != state->isMuted.load()) {
+        state->isMuted = isMuted;
+
+        if (isMuted) {
+            StartBlinking(buttonIndex);
+        } else {
+            StopBlinking(buttonIndex);
         }
-        buttonStates[buttonIndex]->blinkThread = new std::thread(BlinkButton, buttonIndex, config.muteColor);
-        buttonStates[buttonIndex]->blinkThread->detach();
-    }
-    else if (data2 == 0 && buttonStates[buttonIndex]->isMuted) {
-        buttonStates[buttonIndex]->isMuted = false;
-        buttonStates[buttonIndex]->isBlinking = false;
-        Sleep(100);
-        SetButtonColor(buttonIndex, config.defaultColor);
     }
 }
 
-void CALLBACK MidiInProc(HMIDIIN hMidiIn, UINT wMsg, DWORD_PTR dwInstance, DWORD_PTR dwParam1, DWORD_PTR dwParam2) {
-    if (wMsg == MIM_DATA) {
-        BYTE status = dwParam1 & 0xFF;
-        BYTE data1 = (dwParam1 >> 8) & 0xFF;
-        BYTE data2 = (dwParam1 >> 16) & 0xFF;
-
-        if (status == 153 && data1 >= 48 && data1 <= 55) {
-            int buttonIndex = data1 - 48;
-            HandleButtonPress(buttonIndex, data2);
+void VoicemeeterPollingThread() {
+    while (isRunning) {
+        // Check if any parameters changed
+        if (VBVMR_IsParametersDirty && VBVMR_IsParametersDirty() > 0) {
+            // Update all buttons from Voicemeeter state
+            for (int i = 0; i < 8; ++i) {
+                UpdateButtonFromVoicemeeter(i);
+            }
         }
+        Sleep(50);  // Poll every 50ms
     }
 }
 
 void InitializeButtonConfigs() {
+    // Map each button to a Voicemeeter strip (0-7 for Potato's 8 strips)
     buttonConfigs = {
-        {48, "Microphone", 0x01, 0x01},
-        {49, "PlayStation", 0x10, 0x10},
-        {50, "Spotify", 0x04, 0x04},
-        {51, "Chrome", 0x05, 0x05},
-        {52, "Console 2", 0x14, 0x14},
-        {53, "Default Channel", 0x7F, 0x7F},
-        {54, "Game Channel", 0x7F, 0x7F},
-        {55, "VOIP Channel", 0x7F, 0x7F}
+        {48, "Microphone",      0, 0x01, 0x01},  // Strip 0
+        {49, "PlayStation",     1, 0x10, 0x10},  // Strip 1
+        {50, "Spotify",         2, 0x04, 0x04},  // Strip 2
+        {51, "Chrome",          3, 0x05, 0x05},  // Strip 3
+        {52, "Console 2",       4, 0x14, 0x14},  // Strip 4
+        {53, "Default Channel", 5, 0x7F, 0x7F},  // Strip 5
+        {54, "Game Channel",    6, 0x7F, 0x7F},  // Strip 6
+        {55, "VOIP Channel",    7, 0x7F, 0x7F}   // Strip 7
     };
-}
-
-bool InitializeMidiDevices() {
-    bool hasLoopMIDI = false, hasMiniLab = false;
-    UINT numInputDevices = midiInGetNumDevs();
-
-    for (UINT i = 0; i < numInputDevices; ++i) {
-        MIDIINCAPS caps;
-        if (midiInGetDevCaps(i, &caps, sizeof(MIDIINCAPS)) == MMSYSERR_NOERROR) {
-            if (std::wstring(caps.szPname) == REQUIRED_INPUT_DEVICE) {
-                hasLoopMIDI = true;
-            }
-            if (std::wstring(caps.szPname) == REQUIRED_OUTPUT_DEVICE) {
-                hasMiniLab = true;
-            }
-        }
-    }
-
-    if (!hasLoopMIDI || !hasMiniLab) {
-        return false;
-    }
-
-    return true;
-}
-
-bool OpenMidiInputDevice() {
-    HMIDIIN hMidiIn = nullptr;
-    UINT numInputDevices = midiInGetNumDevs();
-
-    for (UINT i = 0; i < numInputDevices; ++i) {
-        MIDIINCAPS caps;
-        if (midiInGetDevCaps(i, &caps, sizeof(MIDIINCAPS)) == MMSYSERR_NOERROR) {
-            if (std::wstring(caps.szPname) == REQUIRED_INPUT_DEVICE) {
-                if (midiInOpen(&hMidiIn, i, (DWORD_PTR)MidiInProc, 0, CALLBACK_FUNCTION) == MMSYSERR_NOERROR) {
-                    midiInStart(hMidiIn);
-                    return true;
-                }
-            }
-        }
-    }
-
-    return false;
 }
 
 bool OpenMidiOutputDevice() {
@@ -190,23 +251,38 @@ bool OpenMidiOutputDevice() {
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     InitializeButtonConfigs();
 
-    std::vector<BYTE> defaultColors = { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x06, 0x06 };
+    // Initialize button states with colors from config
     for (int i = 0; i < 8; ++i) {
-        buttonStates[i] = std::make_unique<ButtonState>(defaultColors[i], false, false);
+        buttonStates[i] = std::make_unique<ButtonState>(
+            buttonConfigs[i].defaultColor,
+            buttonConfigs[i].muteColor
+        );
     }
 
-    if (!InitializeMidiDevices()) {
+    // Initialize Voicemeeter API
+    if (!InitializeVoicemeeterAPI()) {
         return 1;
     }
 
-    if (!OpenMidiInputDevice() || !OpenMidiOutputDevice()) {
+    // Open MIDI output device
+    if (!OpenMidiOutputDevice()) {
+        ShutdownVoicemeeterAPI();
         return 1;
     }
 
+    // Set initial LED colors
     for (int i = 0; i < 8; ++i) {
-        SetButtonColor(i, buttonStates[i]->color);
+        SetButtonColor(i, buttonStates[i]->defaultColor);
         Sleep(50);
     }
+
+    // Do initial sync with Voicemeeter state
+    for (int i = 0; i < 8; ++i) {
+        UpdateButtonFromVoicemeeter(i);
+    }
+
+    // Start Voicemeeter polling thread
+    std::thread pollThread(VoicemeeterPollingThread);
 
     // Run indefinitely in the background
     MSG msg;
@@ -217,9 +293,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     isRunning = false;
 
+    // Wait for polling thread to finish
+    if (pollThread.joinable()) {
+        pollThread.join();
+    }
+
+    // Cleanup
     if (hMidiOut) {
         midiOutClose(hMidiOut);
     }
+
+    ShutdownVoicemeeterAPI();
 
     return 0;
 }

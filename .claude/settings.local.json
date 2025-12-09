@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:download.vb-audio.com)",
+      "WebFetch(domain:github.com)"
+    ]
+  }
+}
